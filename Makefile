@@ -437,7 +437,7 @@ IOS_SOURCES := $(filter-out iOS/installer.m, $(shell ls iOS/*.m)) $(shell ls App
 COCOA_SOURCES := $(shell ls Cocoa/*.m) $(shell ls HexFiend/*.m) $(shell ls JoyKit/*.m) $(shell ls AppleCommon/*.m)
 QUICKLOOK_SOURCES := $(shell ls QuickLook/*.m) $(shell ls QuickLook/*.c)
 XDG_THUMBNAILER_SOURCES := $(shell ls XdgThumbnailer/*.c)
-JSON_SERVER_SOURCES := SDL/json_mode.c SDL/audio.c SDL/utils.c $(patsubst %,SDL/audio/%.c,$(SDL_AUDIO_DRIVERS))
+JSON_SERVER_SOURCES := SDL/json_mode.c SDL/audio.c SDL/utils.c lib/yyjson/yyjson.c $(patsubst %,SDL/audio/%.c,$(SDL_AUDIO_DRIVERS))
 
 ifeq ($(PLATFORM),windows32)
 CORE_SOURCES += $(shell ls Windows/*.c)
@@ -527,6 +527,11 @@ $(OBJ)/SDL/json_mode.c.o: SDL/json_mode.c
 $(OBJ)/SDL/json_mode.dep: SDL/json_mode.c
 	-@$(MKDIR) -p $(dir $@)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -DGB_INTERNAL -MT $(OBJ)/$^.o -M $^ -o $@
+
+# Vendored yyjson — plain ANSI C, no frontend flags
+$(OBJ)/lib/yyjson/%.c.o: lib/yyjson/%.c
+	-@$(MKDIR) -p $(dir $@)
+	$(CC) $(CFLAGS) -w -c $< -o $@
 
 
 $(OBJ)/%.c.o: %.c
