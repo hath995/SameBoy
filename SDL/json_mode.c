@@ -2,7 +2,6 @@
 // Reads JSON commands from stdin, returns JSON responses to stdout
 // Optional SDL display for visual feedback
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +21,12 @@
 #include "audio/audio.h"
 #include "utils.h"
 #include "json_mode.h"
+
+// Core/defs.h defines `noinline` as an attribute macro which recursively
+// breaks yyjson's own `__attribute__((noinline))` expansion. This translation
+// unit does not use Core's `noinline`, so drop it for yyjson.
+#undef noinline
+#include "lib/yyjson/yyjson.h"
 
 // Configuration struct required by audio subsystem
 configuration_t configuration = { 0 };
@@ -189,192 +194,120 @@ static uint32_t json_rgb_encode(GB_gameboy_t *gb, uint8_t r, uint8_t g, uint8_t 
     return ((uint32_t) r << 16) | ((uint32_t) g << 8) | (uint32_t) b | 0xFF000000;
 }
 
-// Minimal JSON parser — good enough for our protocol
+// ---------------------------------------------------------------------------
+// JSON (yyjson) — request param accessors and response builders
+// ---------------------------------------------------------------------------
 
-static const char *json_skip_ws(const char *p)
+static char *json_exec_debugger_cmd(const char *cmd);
+
+// Read a number param (0 if missing or not a number)
+static double json_pnum(yyjson_val *params, const char *key, double defval)
 {
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    return p;
+    yyjson_val *v = params ? yyjson_obj_get(params, key) : NULL;
+    return (v && yyjson_is_num(v)) ? yyjson_get_num(v) : defval;
 }
 
-static const char *json_parse_string(const char *p, char *out, size_t out_size)
+// Read a string param (borrowed pointer, valid while the request is alive)
+static const char *json_pstr(yyjson_val *params, const char *key, const char *defval)
 {
-    if (*p != '"') return NULL;
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < out_size - 1) {
-        if (*p == '\\') {
-            p++;
-            switch (*p) {
-                case '"': out[i++] = '"'; break;
-                case '\\': out[i++] = '\\'; break;
-                case '/': out[i++] = '/'; break;
-                case 'n': out[i++] = '\n'; break;
-                case 't': out[i++] = '\t'; break;
-                case 'r': out[i++] = '\r'; break;
-                default: out[i++] = *p; break;
-            }
-        }
-        else {
-            out[i++] = *p;
-        }
-        p++;
+    yyjson_val *v = params ? yyjson_obj_get(params, key) : NULL;
+    return (v && yyjson_is_str(v)) ? yyjson_get_str(v) : defval;
+}
+
+// Read a bool param
+static bool json_pbool(yyjson_val *params, const char *key, bool defval)
+{
+    yyjson_val *v = params ? yyjson_obj_get(params, key) : NULL;
+    return (v && yyjson_is_bool(v)) ? yyjson_get_bool(v) : defval;
+}
+
+// Key present and not null
+static bool json_phas(yyjson_val *params, const char *key)
+{
+    yyjson_val *v = params ? yyjson_obj_get(params, key) : NULL;
+    return (v != NULL) && !yyjson_is_null(v);
+}
+
+// New doc containing a response frame {"id":id}; caller adds "result"/"error"
+static yyjson_mut_doc *json_frame_doc(unsigned id)
+{
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (doc) {
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_uint(doc, root, "id", id);
     }
-    out[i] = '\0';
-    if (*p == '"') p++;
-    return p;
+    return doc;
 }
 
-// Skip a scalar, string, array or object; returns the first character after it
-static const char *json_skip_value(const char *p)
+// New doc containing a notification frame {"method":method}
+static yyjson_mut_doc *json_notification_doc(const char *method)
 {
-    p = json_skip_ws(p);
-    if (*p == '"') {
-        p++;
-        while (*p && *p != '"') {
-            if (*p == '\\') p++;
-            p++;
-        }
-        return *p ? p + 1 : p;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (doc) {
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_str(doc, root, "method", method);
     }
-    if (*p == '{' || *p == '[') {
-        char closing = *p == '{' ? '}' : ']';
-        unsigned depth = 0;
-        for (; *p; p++) {
-            if (*p == '"') {
-                p++;
-                while (*p && *p != '"') {
-                    if (*p == '\\') p++;
-                    p++;
-                }
-                if (!*p) return p;
-            }
-            else if (*p == '{' || *p == '[') depth++;
-            else if (*p == '}' || *p == ']') {
-                if (*p == closing && --depth == 0) return p + 1;
-            }
-        }
-        return p;
+    return doc;
+}
+
+// Serialize a frame doc to stdout, newline-terminated, and free it
+static void json_send_doc(yyjson_mut_doc *doc)
+{
+    if (!doc) return;
+    char *s = yyjson_mut_write(doc, 0, NULL);
+    if (s) {
+        fputs(s, stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+        free(s);
     }
-    while (*p && *p != ',' && *p != '}' && *p != ']') p++;
-    return p;
+    yyjson_mut_doc_free(doc);
 }
 
-// Find the value of a key in the top-level object, respecting nesting
-static const char *json_object_find(const char *json, const char *key)
+// Send {"id":id,"result":<result>} (null result if result is NULL)
+static void json_send_result(yyjson_mut_doc *doc, yyjson_mut_val *result)
 {
-    const char *p = json_skip_ws(json);
-    if (*p != '{') return NULL;
-    p = json_skip_ws(p + 1);
-    while (*p && *p != '}') {
-        char name[128];
-        const char *value = json_parse_string(p, name, sizeof(name));
-        if (!value) return NULL;
-        value = json_skip_ws(value);
-        if (*value != ':') return NULL;
-        value = json_skip_ws(value + 1);
-        if (strcmp(name, key) == 0) return value;
-        p = json_skip_ws(json_skip_value(value));
-        if (*p == ',') p = json_skip_ws(p + 1);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_doc_get_root(doc);
+    if (result) yyjson_mut_obj_add_val(doc, root, "result", result);
+    else yyjson_mut_obj_add_null(doc, root, "result");
+    json_send_doc(doc);
+}
+
+// Send {"id":id,"result":"str"} (string is copied into the doc)
+static void json_send_string(unsigned id, const char *str)
+{
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_doc_get_root(doc);
+    if (str) yyjson_mut_obj_add_strcpy(doc, root, "result", str);
+    else yyjson_mut_obj_add_null(doc, root, "result");
+    json_send_doc(doc);
+}
+
+// Send {"id":id,"error":"msg"} (message is copied and escaped properly)
+static void json_send_error(unsigned id, const char *msg)
+{
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return;
+    yyjson_mut_obj_add_strcpy(doc, yyjson_mut_doc_get_root(doc), "error",
+                              msg ? msg : "error");
+    json_send_doc(doc);
+}
+
+// Run a debugger command and send its output as {"id":id,"result":{key: out}}
+static void json_send_debugger_output(unsigned id, const char *cmd, const char *key)
+{
+    char *result = json_exec_debugger_cmd(cmd);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (doc) {
+        yyjson_mut_val *r = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, r, key, result ? result : "");
+        json_send_result(doc, r);
     }
-    return NULL;
-}
-
-// Strings extracted from a command only need to live until the command is
-// done; a pool reset per command avoids per-string allocation. The pool is
-// sized for the maximum command line, so it cannot overflow in practice.
-#define JSON_MAX_LINE 65536
-static char json_pool[JSON_MAX_LINE * 2];
-static size_t json_pool_pos = 0;
-
-static char *json_pool_strdup(const char *s)
-{
-    size_t len = strlen(s) + 1;
-    if (json_pool_pos + len > sizeof(json_pool)) {
-        return NULL;
-    }
-    char *result = &json_pool[json_pool_pos];
-    memcpy(result, s, len);
-    json_pool_pos += len;
-    return result;
-}
-
-static const char *json_get_string(const char *json, const char *key, const char *default_val)
-{
-    const char *value = json_object_find(json, key);
-    if (!value || *value != '"') return default_val;
-    char parsed[1024];
-    if (!json_parse_string(value, parsed, sizeof(parsed))) return default_val;
-    char *copy = json_pool_strdup(parsed);
-    return copy ? copy : default_val;
-}
-
-static double json_get_number(const char *json, const char *key, double default_val)
-{
-    const char *value = json_object_find(json, key);
-    if (!value || *value == '"') return default_val;
-    return strtod(value, NULL);
-}
-
-static bool json_get_bool(const char *json, const char *key, bool default_val)
-{
-    const char *value = json_object_find(json, key);
-    if (!value) return default_val;
-    if (strncmp(value, "true", 4) == 0) return true;
-    if (strncmp(value, "false", 5) == 0) return false;
-    return default_val;
-}
-
-static bool json_has_key(const char *json, const char *key)
-{
-    const char *value = json_object_find(json, key);
-    return value && strncmp(value, "null", 4) != 0;
-}
-
-static const char *json_get_params(const char *json)
-{
-    const char *value = json_object_find(json, "params");
-    return (value && *value == '{') ? value : "{}";
-}
-
-// Output building — a writer over a shared buffer keeps array construction
-// O(n) and off the stack; the loop is single-threaded, so one buffer is enough.
-typedef struct {
-    char *buffer;
-    size_t size;
-    size_t pos;
-} json_writer_t;
-
-static void json_write(json_writer_t *writer, const char *fmt, ...)
-{
-    if (writer->pos + 1 >= writer->size) return;
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(writer->buffer + writer->pos, writer->size - writer->pos, fmt, args);
-    va_end(args);
-    if (written > 0) writer->pos += (size_t) written;
-    if (writer->pos >= writer->size) writer->pos = writer->size - 1;
-}
-
-static char out_buf[JSON_MAX_LINE];
-static char esc_buf[JSON_MAX_LINE];
-
-static void json_send_response(unsigned id, const char *result_json)
-{
-    fprintf(stdout, "{\"id\":%u,\"result\":%s}\n", id, result_json);
-    fflush(stdout);
-}
-
-static void json_send_error(unsigned id, const char *error_msg)
-{
-    fprintf(stdout, "{\"id\":%u,\"error\":\"%s\"}\n", id, error_msg);
-    fflush(stdout);
-}
-
-static void json_send_notification(const char *method, const char *params_json)
-{
-    fprintf(stdout, "{\"method\":\"%s\",\"params\":%s}\n", method, params_json);
-    fflush(stdout);
+    free(result);
 }
 
 // Capture log output
@@ -409,38 +342,18 @@ static char *json_exec_debugger_cmd(const char *cmd)
     return result;
 }
 
-static void json_escape_string(const char *src, char *dst, size_t dst_size)
-{
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j < dst_size - 2; i++) {
-        switch (src[i]) {
-            case '"': if (j + 2 < dst_size) { dst[j++] = '\\'; dst[j++] = '"'; } break;
-            case '\\': if (j + 2 < dst_size) { dst[j++] = '\\'; dst[j++] = '\\'; } break;
-            case '\n': if (j + 2 < dst_size) { dst[j++] = '\\'; dst[j++] = 'n'; } break;
-            case '\r': if (j + 2 < dst_size) { dst[j++] = '\\'; dst[j++] = 'r'; } break;
-            case '\t': if (j + 2 < dst_size) { dst[j++] = '\\'; dst[j++] = 't'; } break;
-            default: dst[j++] = src[i]; break;
-        }
-    }
-    dst[j] = '\0';
-}
-
-// Run a debugger command and return its captured output as {"key": "..."}
-static void json_send_command_output(unsigned id, const char *key, const char *cmd)
-{
-    char *result = json_exec_debugger_cmd(cmd);
-    json_escape_string(result ? result : "", esc_buf, sizeof(esc_buf));
-    free(result);
-    snprintf(out_buf, sizeof(out_buf), "{\"%s\":\"%s\"}", key, esc_buf);
-    json_send_response(id, out_buf);
-}
-
-static void json_get_registers(GB_gameboy_t *gb, char *buf, size_t buf_size)
+static yyjson_mut_val *json_registers_val(yyjson_mut_doc *doc, GB_gameboy_t *gb)
 {
     GB_registers_t *regs = GB_get_registers(gb);
-    snprintf(buf, buf_size,
-        "{\"af\":%u,\"bc\":%u,\"de\":%u,\"hl\":%u,\"sp\":%u,\"pc\":%u,\"ime\":%u}",
-        regs->af, regs->bc, regs->de, regs->hl, regs->sp, regs->pc, gb->ime);
+    yyjson_mut_val *v = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, v, "af", regs->af);
+    yyjson_mut_obj_add_uint(doc, v, "bc", regs->bc);
+    yyjson_mut_obj_add_uint(doc, v, "de", regs->de);
+    yyjson_mut_obj_add_uint(doc, v, "hl", regs->hl);
+    yyjson_mut_obj_add_uint(doc, v, "sp", regs->sp);
+    yyjson_mut_obj_add_uint(doc, v, "pc", regs->pc);
+    yyjson_mut_obj_add_uint(doc, v, "ime", gb->ime);
+    return v;
 }
 
 static const char *const json_register_names[] = {
@@ -473,76 +386,77 @@ static uint16_t json_get_register(GB_gameboy_t *gb, const char *name)
     return 0;
 }
 
-// VRAM tile as structured data
-static void json_vram_tile_data(GB_gameboy_t *gb, uint8_t tile_id, char *buf, size_t buf_size)
+// VRAM tile as structured data: {"tile_id":N,"pixels":[[8],[8]...]}
+static yyjson_mut_val *json_vram_tile_val(yyjson_mut_doc *doc, GB_gameboy_t *gb, uint8_t tile_id)
 {
     uint8_t *vram = GB_get_direct_access(gb, GB_DIRECT_ACCESS_VRAM, NULL, NULL);
+    // CGB has 2 banks, 256 tiles each
     uint16_t offset = tile_id * 16;
-    if (!vram || offset > 0x3FF0) {
-        snprintf(buf, buf_size, "null");
-        return;
-    }
+    if (!vram || offset > 0x3FF0) return yyjson_mut_null(doc);
 
-    json_writer_t writer = {buf, buf_size, 0};
-    json_write(&writer, "{\"tile_id\":%u,\"pixels\":[", tile_id);
+    yyjson_mut_val *v = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, v, "tile_id", tile_id);
+    yyjson_mut_val *pixels = yyjson_mut_arr(doc);
     for (unsigned y = 0; y < 8; y++) {
-        json_write(&writer, "%s[", y > 0 ? "," : "");
+        yyjson_mut_val *row = yyjson_mut_arr(doc);
         for (unsigned x = 0; x < 8; x++) {
             // Each row is two bitplanes, bit 7 - x of each
             uint8_t lo = vram[offset + y * 2];
             uint8_t hi = vram[offset + y * 2 + 1];
             uint8_t pixel = ((hi >> (7 - x)) & 1) | (((lo >> (7 - x)) & 1) << 1);
-            json_write(&writer, "%s%u", x > 0 ? "," : "", pixel);
+            yyjson_mut_arr_add_uint(doc, row, pixel);
         }
-        json_write(&writer, "]");
+        yyjson_mut_arr_add_val(pixels, row);
     }
-    json_write(&writer, "]}");
+    yyjson_mut_obj_add_val(doc, v, "pixels", pixels);
+    return v;
 }
 
-static void json_oam_sprite(GB_gameboy_t *gb, uint8_t sprite_id, char *buf, size_t buf_size)
+static yyjson_mut_val *json_oam_sprite_val(yyjson_mut_doc *doc, GB_gameboy_t *gb, uint8_t sprite_id)
 {
     uint8_t *oam = GB_get_direct_access(gb, GB_DIRECT_ACCESS_OAM, NULL, NULL);
-    if (!oam || sprite_id >= 40) {
-        snprintf(buf, buf_size, "null");
-        return;
-    }
+    if (!oam || sprite_id >= 40) return yyjson_mut_null(doc);
 
     uint8_t *s = &oam[sprite_id * 4];
-    snprintf(buf, buf_size,
-        "{\"id\":%u,\"y\":%u,\"x\":%u,\"tile\":%u,\"attributes\":{\"flip_y\":%u,\"flip_x\":%u,\"priority\":%u,\"palette\":%u}}",
-        sprite_id, s[0] - 16, s[1] - 8, s[2],
-        (s[3] >> 6) & 1, (s[3] >> 5) & 1, (s[3] >> 4) & 1, s[3] & 0xF);
+    yyjson_mut_val *v = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, v, "id", sprite_id);
+    yyjson_mut_obj_add_uint(doc, v, "y", (uint32_t) (s[0] - 16));
+    yyjson_mut_obj_add_uint(doc, v, "x", (uint32_t) (s[1] - 8));
+    yyjson_mut_obj_add_uint(doc, v, "tile", s[2]);
+    yyjson_mut_val *attrs = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, attrs, "flip_y", (s[3] >> 6) & 1);
+    yyjson_mut_obj_add_uint(doc, attrs, "flip_x", (s[3] >> 5) & 1);
+    yyjson_mut_obj_add_uint(doc, attrs, "priority", (s[3] >> 4) & 1);
+    yyjson_mut_obj_add_uint(doc, attrs, "palette", s[3] & 0xF);
+    yyjson_mut_obj_add_val(doc, v, "attributes", attrs);
+    return v;
 }
 
-// Context snapshot: registers + disassembly
-static void json_context_snapshot(GB_gameboy_t *gb, uint16_t addr, uint16_t range, char *buf, size_t buf_size)
+// Context snapshot: registers + pc + disassembly
+static yyjson_mut_val *json_context_snapshot_val(yyjson_mut_doc *doc, GB_gameboy_t *gb,
+                                                 uint16_t addr, uint16_t range)
 {
-    char regs_json[256];
-    json_get_registers(gb, regs_json, sizeof(regs_json));
-
+    yyjson_mut_val *v = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, v, "registers", json_registers_val(doc, gb));
+    yyjson_mut_obj_add_uint(doc, v, "pc", addr);
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "disassemble $%04x/%u", addr, range * 2 + 1);
     char *disasm = json_exec_debugger_cmd(cmd);
-
-    json_escape_string(disasm ? disasm : "", esc_buf, sizeof(esc_buf));
+    yyjson_mut_obj_add_strcpy(doc, v, "disassembly", disasm ? disasm : "");
     free(disasm);
-
-    snprintf(buf, buf_size,
-        "{\"registers\":%s,\"pc\":%u,\"disassembly\":\"%s\"}",
-        regs_json, addr, esc_buf);
+    return v;
 }
 
 static void json_send_stop_notification(GB_gameboy_t *gb)
 {
-    char regs_json[256];
-    json_get_registers(gb, regs_json, sizeof(regs_json));
-
+    yyjson_mut_doc *doc = json_notification_doc("debugger.stopped");
+    if (!doc) return;
     GB_registers_t *regs = GB_get_registers(gb);
-    char params_json[512];
-    snprintf(params_json, sizeof(params_json),
-        "{\"pc\":%u,\"registers\":%s}", regs->pc, regs_json);
-
-    json_send_notification("debugger.stopped", params_json);
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, params, "pc", regs->pc);
+    yyjson_mut_obj_add_val(doc, params, "registers", json_registers_val(doc, gb));
+    yyjson_mut_obj_add_val(doc, yyjson_mut_doc_get_root(doc), "params", params);
+    json_send_doc(doc);
 }
 
 // Input callback (blocking — called when the debugger stops)
@@ -561,17 +475,17 @@ static char *json_async_input_callback(GB_gameboy_t *gb)
 
 // Command handlers. Returning true requests shutdown after responding.
 
-static bool handle_quit(unsigned id, const char *params)
+static bool handle_quit(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return true;
 }
 
-static bool handle_rom_load(unsigned id, const char *params)
+static bool handle_rom_load(unsigned id, yyjson_val *params)
 {
-    const char *path = json_get_string(params, "path", "");
-    if (!path || !path[0]) {
+    const char *path = json_pstr(params, "path", "");
+    if (!path[0]) {
         json_send_error(id, "missing path");
         return false;
     }
@@ -581,246 +495,257 @@ static bool handle_rom_load(unsigned id, const char *params)
     }
     free(current_rom);
     current_rom = strdup(path);
-    json_send_response(id, "\"loaded\"");
+    json_send_string(id, "loaded");
     return false;
 }
 
-static bool handle_emulator_reset(unsigned id, const char *params)
+static bool handle_emulator_reset(unsigned id, yyjson_val *params)
 {
-    if (json_get_bool(params, "reload", false)) {
+    if (json_pbool(params, "reload", false)) {
         GB_reset(&gb);
     }
     else {
         GB_quick_reset(&gb);
     }
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_emulator_pause(unsigned id, const char *params)
+static bool handle_emulator_pause(unsigned id, yyjson_val *params)
 {
     (void) params;
     json_running = false;
     GB_debugger_break(&gb);
-    json_send_response(id, "\"paused\"");
+    json_send_string(id, "paused");
     return false;
 }
 
-static bool handle_emulator_resume(unsigned id, const char *params)
+static bool handle_emulator_resume(unsigned id, yyjson_val *params)
 {
     (void) params;
     gb.debug_stopped = false;
     json_breakpoint_hit = false;
     json_running = true;
-    json_send_response(id, "\"running\"");
+    json_send_string(id, "running");
     return false;
 }
 
-static bool handle_cpu_step(unsigned id, const char *params)
+static bool handle_cpu_step(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "output", "step");
+    json_send_debugger_output(id, "step", "output");
     return false;
 }
 
-static bool handle_cpu_next(unsigned id, const char *params)
+static bool handle_cpu_next(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "output", "next");
+    json_send_debugger_output(id, "next", "output");
     return false;
 }
 
-static bool handle_cpu_finish(unsigned id, const char *params)
+static bool handle_cpu_finish(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "output", "finish");
+    json_send_debugger_output(id, "finish", "output");
     return false;
 }
 
-static bool handle_cpu_backstep(unsigned id, const char *params)
+static bool handle_cpu_backstep(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "output", "backstep");
+    json_send_debugger_output(id, "backstep", "output");
     return false;
 }
 
-static bool handle_cpu_undo(unsigned id, const char *params)
+static bool handle_cpu_undo(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "output", "undo");
+    json_send_debugger_output(id, "undo", "output");
     return false;
 }
 
-static bool handle_registers_read(unsigned id, const char *params)
+static bool handle_registers_read(unsigned id, yyjson_val *params)
 {
-    const char *name = json_get_string(params, "name", NULL);
+    const char *name = json_pstr(params, "name", NULL);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
     if (!name) {
-        json_get_registers(&gb, out_buf, sizeof(out_buf));
-        json_send_response(id, out_buf);
+        json_send_result(doc, json_registers_val(doc, &gb));
         return false;
     }
     const char *canonical = json_canonical_register_name(name);
     if (!canonical) {
+        yyjson_mut_doc_free(doc);
         json_send_error(id, "unknown register");
         return false;
     }
     uint16_t value = json_get_register(&gb, canonical);
-    snprintf(out_buf, sizeof(out_buf), "{\"%s\":%u,\"hex\":\"$%04x\"}", canonical, value, value);
-    json_send_response(id, out_buf);
+    char hex[16];
+    snprintf(hex, sizeof(hex), "$%04x", value);
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, result, canonical, value);
+    yyjson_mut_obj_add_strcpy(doc, result, "hex", hex);
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_registers_write(unsigned id, const char *params)
+static bool handle_registers_write(unsigned id, yyjson_val *params)
 {
-    const char *name = json_get_string(params, "name", "");
-    uint16_t value = (uint16_t) json_get_number(params, "value", 0);
+    const char *name = json_pstr(params, "name", "");
+    uint16_t value = (uint16_t) json_pnum(params, "value", 0);
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "%s = $%04x", name, value);
     free(json_exec_debugger_cmd(cmd));
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_memory_read(unsigned id, const char *params)
+static bool handle_memory_read(unsigned id, yyjson_val *params)
 {
-    uint16_t address = (uint16_t) json_get_number(params, "address", 0);
-    uint16_t size = (uint16_t) json_get_number(params, "size", 1);
-
-    json_writer_t writer = {out_buf, sizeof(out_buf), 0};
-    json_write(&writer, "{\"data\":[");
+    uint16_t address = (uint16_t) json_pnum(params, "address", 0);
+    uint16_t size = (uint16_t) json_pnum(params, "size", 1);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_val *data = yyjson_mut_arr(doc);
     for (uint16_t i = 0; i < size && i < 65535; i++) {
-        json_write(&writer, "%s%u", i > 0 ? "," : "", GB_read_memory(&gb, address + i));
+        yyjson_mut_arr_add_uint(doc, data, GB_read_memory(&gb, address + i));
     }
-    json_write(&writer, "]}");
-    json_send_response(id, out_buf);
+    yyjson_mut_obj_add_val(doc, result, "data", data);
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_memory_write(unsigned id, const char *params)
+static bool handle_memory_write(unsigned id, yyjson_val *params)
 {
-    uint16_t address = (uint16_t) json_get_number(params, "address", 0);
-    const char *data = json_object_find(params, "data");
-    if (data && *data == '[') {
-        data = json_skip_ws(data + 1);
-        while (*data && *data != ']') {
-            if (*data == ',') {
-                data = json_skip_ws(data + 1);
-                continue;
-            }
-            char *end;
-            double value = strtod(data, &end);
-            if (end == data) break; // Not a number, stop instead of spinning
-            GB_write_memory(&gb, address++, (uint8_t) value);
-            data = json_skip_ws(end);
+    uint16_t address = (uint16_t) json_pnum(params, "address", 0);
+    yyjson_val *data = params ? yyjson_obj_get(params, "data") : NULL;
+    if (yyjson_is_arr(data)) {
+        yyjson_val *item;
+        size_t idx, max;
+        yyjson_arr_foreach(data, idx, max, item) {
+            GB_write_memory(&gb, (uint16_t) (address + idx), (uint8_t) yyjson_get_int(item));
         }
     }
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_memory_dump(unsigned id, const char *params)
+static bool handle_memory_dump(unsigned id, yyjson_val *params)
 {
-    uint16_t address = (uint16_t) json_get_number(params, "address", 0);
-    uint16_t size = (uint16_t) json_get_number(params, "size", 16);
+    uint16_t address = (uint16_t) json_pnum(params, "address", 0);
+    uint16_t size = (uint16_t) json_pnum(params, "size", 16);
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "examine $%04x/%u", address, size);
-    json_send_command_output(id, "dump", cmd);
+    json_send_debugger_output(id, cmd, "dump");
     return false;
 }
 
-static bool handle_breakpoint_add(unsigned id, const char *params)
+static bool handle_breakpoint_add(unsigned id, yyjson_val *params)
 {
-    uint16_t address = (uint16_t) json_get_number(params, "address", 0);
-    const char *condition = json_get_string(params, "condition", NULL);
-    uint16_t range_end = (uint16_t) json_get_number(params, "range_end", 0);
-    bool inclusive = json_get_bool(params, "inclusive", false);
+    uint16_t address = (uint16_t) json_pnum(params, "address", 0);
+    const char *condition = json_pstr(params, "condition", NULL);
+    uint16_t range_end = (uint16_t) json_pnum(params, "range_end", 0);
+    bool inclusive = json_pbool(params, "inclusive", false);
 
-    json_writer_t writer = {out_buf, sizeof(out_buf), 0};
-    json_write(&writer, "breakpoint $%04x", address);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "breakpoint $%04x", address);
     if (range_end) {
-        json_write(&writer, " to $%04x%s", range_end, inclusive ? " inclusive" : "");
+        snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " to $%04x%s",
+                 range_end, inclusive ? " inclusive" : "");
     }
     if (condition) {
-        json_write(&writer, " if %s", condition);
+        snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " if %s", condition);
     }
-    free(json_exec_debugger_cmd(out_buf));
-    json_send_response(id, "\"ok\"");
+
+    free(json_exec_debugger_cmd(cmd));
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_breakpoint_remove(unsigned id, const char *params)
+static bool handle_breakpoint_remove(unsigned id, yyjson_val *params)
 {
     char cmd[64] = "delete";
-    if (json_has_key(params, "id")) {
+    if (json_phas(params, "id")) {
         snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " %u",
-                 (unsigned) json_get_number(params, "id", 0));
+                 (unsigned) json_pnum(params, "id", 0));
     }
     free(json_exec_debugger_cmd(cmd));
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_breakpoint_list(unsigned id, const char *params)
+static bool handle_breakpoint_list(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "breakpoints", "list");
+    json_send_debugger_output(id, "list", "breakpoints");
     return false;
 }
 
-static bool handle_watchpoint_add(unsigned id, const char *params)
+static bool handle_watchpoint_add(unsigned id, yyjson_val *params)
 {
-    uint16_t address = (uint16_t) json_get_number(params, "address", 0);
-    const char *type = json_get_string(params, "type", "w");
-    const char *condition = json_get_string(params, "condition", NULL);
+    uint16_t address = (uint16_t) json_pnum(params, "address", 0);
+    const char *type = json_pstr(params, "type", "w");
+    const char *condition = json_pstr(params, "condition", NULL);
 
-    json_writer_t writer = {out_buf, sizeof(out_buf), 0};
-    json_write(&writer, "watch /%s $%04x", type, address);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "watch /%s $%04x", type, address);
     if (condition) {
-        json_write(&writer, " if %s", condition);
+        snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " if %s", condition);
     }
-    free(json_exec_debugger_cmd(out_buf));
-    json_send_response(id, "\"ok\"");
+
+    free(json_exec_debugger_cmd(cmd));
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_watchpoint_remove(unsigned id, const char *params)
+static bool handle_watchpoint_remove(unsigned id, yyjson_val *params)
 {
     char cmd[64] = "unwatch";
-    if (json_has_key(params, "id")) {
+    if (json_phas(params, "id")) {
         snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " %u",
-                 (unsigned) json_get_number(params, "id", 0));
+                 (unsigned) json_pnum(params, "id", 0));
     }
     free(json_exec_debugger_cmd(cmd));
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_watchpoint_list(unsigned id, const char *params)
+static bool handle_watchpoint_list(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "watchpoints", "list");
+    json_send_debugger_output(id, "list", "watchpoints");
     return false;
 }
 
-static bool handle_disassemble(unsigned id, const char *params)
+static bool handle_disassemble(unsigned id, yyjson_val *params)
 {
-    bool has_address = json_has_key(params, "address");
-    uint16_t address = has_address ? (uint16_t) json_get_number(params, "address", 0) : GB_get_registers(&gb)->pc;
-    uint16_t count = (uint16_t) json_get_number(params, "count", 5);
+    bool has_address = json_phas(params, "address");
+    uint16_t address = has_address ? (uint16_t) json_pnum(params, "address", 0) : GB_get_registers(&gb)->pc;
+    uint16_t count = (uint16_t) json_pnum(params, "count", 5);
 
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "disassemble $%04x/%u", address, count);
-    json_send_command_output(id, "disassembly", cmd);
+    json_send_debugger_output(id, cmd, "disassembly");
     return false;
 }
 
-static bool handle_eval(unsigned id, const char *params)
+static bool handle_eval(unsigned id, yyjson_val *params)
 {
-    const char *expression = json_get_string(params, "expression", "");
+    const char *expression = json_pstr(params, "expression", "");
     uint16_t result, bank;
     if (GB_debugger_evaluate(&gb, expression, &result, &bank)) {
-        snprintf(out_buf, sizeof(out_buf), "{\"result\":%u,\"hex\":\"$%04x\",\"bank\":%u}", result, result, bank);
-        json_send_response(id, out_buf);
+        yyjson_mut_doc *doc = json_frame_doc(id);
+        if (doc) {
+            yyjson_mut_val *r = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_uint(doc, r, "result", result);
+            char hex[16];
+            snprintf(hex, sizeof(hex), "$%04x", result);
+            yyjson_mut_obj_add_strcpy(doc, r, "hex", hex);
+            yyjson_mut_obj_add_uint(doc, r, "bank", bank);
+            json_send_result(doc, r);
+        }
     }
     else {
         json_send_error(id, "evaluation failed");
@@ -828,112 +753,112 @@ static bool handle_eval(unsigned id, const char *params)
     return false;
 }
 
-static bool handle_backtrace(unsigned id, const char *params)
+static bool handle_backtrace(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "backtrace", "backtrace");
+    json_send_debugger_output(id, "backtrace", "backtrace");
     return false;
 }
 
-static bool handle_state_save(unsigned id, const char *params)
+static bool handle_state_save(unsigned id, yyjson_val *params)
 {
-    unsigned slot = (unsigned) json_get_number(params, "slot", 0);
+    unsigned slot = (unsigned) json_pnum(params, "slot", 0);
     if (slot > 9) slot = 0;
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "savestate %u", slot);
     free(json_exec_debugger_cmd(cmd));
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_state_load(unsigned id, const char *params)
+static bool handle_state_load(unsigned id, yyjson_val *params)
 {
-    unsigned slot = (unsigned) json_get_number(params, "slot", 0);
+    unsigned slot = (unsigned) json_pnum(params, "slot", 0);
     if (slot > 9) slot = 0;
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "loadstate %u", slot);
     free(json_exec_debugger_cmd(cmd));
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_symbol_load(unsigned id, const char *params)
+static bool handle_symbol_load(unsigned id, yyjson_val *params)
 {
-    const char *path = json_get_string(params, "path", "");
+    const char *path = json_pstr(params, "path", "");
     GB_debugger_load_symbol_file(&gb, path);
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_input_press(unsigned id, const char *params)
+static bool handle_input_press(unsigned id, yyjson_val *params)
 {
-    unsigned key = (unsigned) json_get_number(params, "key", 0);
-    bool state = json_get_bool(params, "state", true);
+    unsigned key = (unsigned) json_pnum(params, "key", 0);
+    bool state = json_pbool(params, "state", true);
     if (key < GB_KEY_MAX) {
         GB_set_key_state(&gb, key, state);
     }
-    json_send_response(id, "\"ok\"");
+    json_send_string(id, "ok");
     return false;
 }
 
-static bool handle_apu_state(unsigned id, const char *params)
+static bool handle_apu_state(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "apu", "apu");
+    json_send_debugger_output(id, "apu", "apu");
     return false;
 }
 
-static bool handle_apu_wave(unsigned id, const char *params)
+static bool handle_apu_wave(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "wave", "wave");
+    json_send_debugger_output(id, "wave", "wave");
     return false;
 }
 
-static bool handle_lcd_state(unsigned id, const char *params)
+static bool handle_lcd_state(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "lcd", "lcd");
+    json_send_debugger_output(id, "lcd", "lcd");
     return false;
 }
 
-static bool handle_cartridge_info(unsigned id, const char *params)
+static bool handle_cartridge_info(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_send_command_output(id, "cartridge", "cartridge");
+    json_send_debugger_output(id, "cartridge", "cartridge");
     return false;
 }
 
-static bool handle_vram_read(unsigned id, const char *params)
+static bool handle_vram_read(unsigned id, yyjson_val *params)
 {
-    uint16_t offset = (uint16_t) json_get_number(params, "offset", 0);
-    uint16_t size = (uint16_t) json_get_number(params, "size", 256);
-
+    uint16_t offset = (uint16_t) json_pnum(params, "offset", 0);
+    uint16_t size = (uint16_t) json_pnum(params, "size", 256);
     uint8_t *vram = GB_get_direct_access(&gb, GB_DIRECT_ACCESS_VRAM, NULL, NULL);
     if (!vram) {
         json_send_error(id, "VRAM access failed");
         return false;
     }
-
-    json_writer_t writer = {out_buf, sizeof(out_buf), 0};
-    json_write(&writer, "{\"data\":[");
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_val *data = yyjson_mut_arr(doc);
     for (uint16_t i = 0; i < size && offset + i < 0x2000; i++) {
-        json_write(&writer, "%s%u", i > 0 ? "," : "", vram[offset + i]);
+        yyjson_mut_arr_add_uint(doc, data, vram[offset + i]);
     }
-    json_write(&writer, "]}");
-    json_send_response(id, out_buf);
+    yyjson_mut_obj_add_val(doc, result, "data", data);
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_vram_tile(unsigned id, const char *params)
+static bool handle_vram_tile(unsigned id, yyjson_val *params)
 {
-    uint8_t tile_id = (uint8_t) json_get_number(params, "tile_id", 0);
-    json_vram_tile_data(&gb, tile_id, out_buf, sizeof(out_buf));
-    json_send_response(id, out_buf);
+    uint8_t tile_id = (uint8_t) json_pnum(params, "tile_id", 0);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (doc) json_send_result(doc, json_vram_tile_val(doc, &gb, tile_id));
     return false;
 }
 
-static bool handle_vram_tiles(unsigned id, const char *params)
+static bool handle_vram_tiles(unsigned id, yyjson_val *params)
 {
     (void) params;
     uint8_t *vram = GB_get_direct_access(&gb, GB_DIRECT_ACCESS_VRAM, NULL, NULL);
@@ -941,106 +866,120 @@ static bool handle_vram_tiles(unsigned id, const char *params)
         json_send_error(id, "VRAM access failed");
         return false;
     }
-
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
     bool cgb = GB_is_cgb_in_cgb_mode(&gb);
-    json_writer_t writer = {out_buf, sizeof(out_buf), 0};
-    json_write(&writer, "{\"count\":%u,\"bank\":%u,\"data\":[",
-               cgb ? 512 : 256, cgb ? (vram[0x40] >> 7) : 0);
+    yyjson_mut_obj_add_uint(doc, result, "count", cgb ? 512 : 256);
+    yyjson_mut_obj_add_uint(doc, result, "bank", cgb ? (vram[0x40] >> 7) : 0);
+    yyjson_mut_val *data = yyjson_mut_arr(doc);
     for (size_t i = 0; i < 0x2000; i++) {
-        json_write(&writer, "%s%u", i > 0 ? "," : "", vram[i]);
+        yyjson_mut_arr_add_uint(doc, data, vram[i]);
     }
-    json_write(&writer, "]}");
-    json_send_response(id, out_buf);
+    yyjson_mut_obj_add_val(doc, result, "data", data);
+    json_send_result(doc, result);
     return false;
 }
 
-static void json_write_all_sprites(json_writer_t *writer)
+static void json_add_all_sprites(yyjson_mut_doc *doc, yyjson_mut_val *sprites)
 {
-    char sprite_json[256];
     for (uint8_t i = 0; i < 40; i++) {
-        json_oam_sprite(&gb, i, sprite_json, sizeof(sprite_json));
-        json_write(writer, "%s%s", i > 0 ? "," : "", sprite_json);
+        yyjson_mut_arr_add_val(sprites, json_oam_sprite_val(doc, &gb, i));
     }
 }
 
-static bool handle_oam_read(unsigned id, const char *params)
+static bool handle_oam_read(unsigned id, yyjson_val *params)
 {
-    if (json_has_key(params, "sprite_id")) {
-        uint8_t sprite_id = (uint8_t) json_get_number(params, "sprite_id", 0);
-        json_oam_sprite(&gb, sprite_id, out_buf, sizeof(out_buf));
-        json_send_response(id, out_buf);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    if (json_phas(params, "sprite_id")) {
+        uint8_t sprite_id = (uint8_t) json_pnum(params, "sprite_id", 0);
+        json_send_result(doc, json_oam_sprite_val(doc, &gb, sprite_id));
         return false;
     }
-
-    json_writer_t writer = {out_buf, sizeof(out_buf), 0};
-    json_write(&writer, "{\"sprites\":[");
-    json_write_all_sprites(&writer);
-    json_write(&writer, "]}");
-    json_send_response(id, out_buf);
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_val *sprites = yyjson_mut_arr(doc);
+    json_add_all_sprites(doc, sprites);
+    yyjson_mut_obj_add_val(doc, result, "sprites", sprites);
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_oam_list(unsigned id, const char *params)
+static bool handle_oam_list(unsigned id, yyjson_val *params)
 {
     (void) params;
-    json_writer_t writer = {out_buf, sizeof(out_buf), 0};
-    json_write(&writer, "[");
-    json_write_all_sprites(&writer);
-    json_write(&writer, "]");
-    json_send_response(id, out_buf);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    yyjson_mut_val *result = yyjson_mut_arr(doc);
+    json_add_all_sprites(doc, result);
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_ppu_state(unsigned id, const char *params)
+static bool handle_ppu_state(unsigned id, yyjson_val *params)
 {
     (void) params;
     uint8_t lcdc = GB_read_memory(&gb, 0xFF40);
     uint8_t stat = GB_read_memory(&gb, 0xFF41);
-    uint8_t scy = GB_read_memory(&gb, 0xFF42);
-    uint8_t scx = GB_read_memory(&gb, 0xFF43);
-    uint8_t ly = GB_read_memory(&gb, 0xFF44);
-    uint8_t lyc = GB_read_memory(&gb, 0xFF45);
 
-    snprintf(out_buf, sizeof(out_buf),
-        "{\"lcdc\":%u,\"stat\":%u,\"scy\":%u,\"scx\":%u,\"ly\":%u,\"lyc\":%u,"
-        "\"lcd_enabled\":%u,\"bg_enabled\":%u,\"sprites_enabled\":%u,\"window_enabled\":%u,\"mode\":%u}",
-        lcdc, stat, scy, scx, ly, lyc,
-        (lcdc >> 7) & 1, (lcdc >> 0) & 1, (lcdc >> 1) & 1, (lcdc >> 5) & 1, stat & 3);
-    json_send_response(id, out_buf);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, result, "lcdc", lcdc);
+    yyjson_mut_obj_add_uint(doc, result, "stat", stat);
+    yyjson_mut_obj_add_uint(doc, result, "scy", GB_read_memory(&gb, 0xFF42));
+    yyjson_mut_obj_add_uint(doc, result, "scx", GB_read_memory(&gb, 0xFF43));
+    yyjson_mut_obj_add_uint(doc, result, "ly", GB_read_memory(&gb, 0xFF44));
+    yyjson_mut_obj_add_uint(doc, result, "lyc", GB_read_memory(&gb, 0xFF45));
+    yyjson_mut_obj_add_uint(doc, result, "lcd_enabled", (lcdc >> 7) & 1);
+    yyjson_mut_obj_add_uint(doc, result, "bg_enabled", (lcdc >> 0) & 1);
+    yyjson_mut_obj_add_uint(doc, result, "sprites_enabled", (lcdc >> 1) & 1);
+    yyjson_mut_obj_add_uint(doc, result, "window_enabled", (lcdc >> 5) & 1);
+    yyjson_mut_obj_add_uint(doc, result, "mode", stat & 3);
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_ppu_palette(unsigned id, const char *params)
+static bool handle_ppu_palette(unsigned id, yyjson_val *params)
 {
     (void) params;
-    snprintf(out_buf, sizeof(out_buf), "{\"bgp\":%u,\"opb0\":%u,\"opb1\":%u}",
-             GB_read_memory(&gb, 0xFF47), GB_read_memory(&gb, 0xFF48), GB_read_memory(&gb, 0xFF49));
-    json_send_response(id, out_buf);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, result, "bgp", GB_read_memory(&gb, 0xFF47));
+    yyjson_mut_obj_add_uint(doc, result, "opb0", GB_read_memory(&gb, 0xFF48));
+    yyjson_mut_obj_add_uint(doc, result, "opb1", GB_read_memory(&gb, 0xFF49));
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_context_snapshot(unsigned id, const char *params)
+static bool handle_context_snapshot(unsigned id, yyjson_val *params)
 {
-    uint16_t address = json_has_key(params, "address") ?
-        (uint16_t) json_get_number(params, "address", 0) : GB_get_registers(&gb)->pc;
-    uint16_t range = (uint16_t) json_get_number(params, "range", 8);
+    uint16_t address = json_phas(params, "address") ?
+        (uint16_t) json_pnum(params, "address", 0) : GB_get_registers(&gb)->pc;
+    uint16_t range = (uint16_t) json_pnum(params, "range", 8);
 
-    json_context_snapshot(&gb, address, range, out_buf, sizeof(out_buf));
-    json_send_response(id, out_buf);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (doc) json_send_result(doc, json_context_snapshot_val(doc, &gb, address, range));
     return false;
 }
 
-static bool handle_context_history(unsigned id, const char *params)
+static bool handle_context_history(unsigned id, yyjson_val *params)
 {
     (void) params;
-    static char snapshot[JSON_MAX_LINE];
-    json_context_snapshot(&gb, GB_get_registers(&gb)->pc, 8, snapshot, sizeof(snapshot));
-    snprintf(out_buf, sizeof(out_buf), "{\"snapshots\":[%s]}", snapshot);
-    json_send_response(id, out_buf);
+    // For now, return the current context
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (!doc) return false;
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_val *snapshots = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_val(snapshots,
+                           json_context_snapshot_val(doc, &gb, GB_get_registers(&gb)->pc, 8));
+    yyjson_mut_obj_add_val(doc, result, "snapshots", snapshots);
+    json_send_result(doc, result);
     return false;
 }
 
-static bool handle_screenshot(unsigned id, const char *params)
+static bool handle_screenshot(unsigned id, yyjson_val *params)
 {
     (void) params;
     uint32_t *pixels = GB_get_pixels_output(&gb);
@@ -1102,20 +1041,23 @@ static bool handle_screenshot(unsigned id, const char *params)
     }
     b64[out_pos] = '\0';
 
-    size_t resp_len = strlen(b64) + 64;
-    char *resp = malloc(resp_len);
-    snprintf(resp, resp_len, "{\"png\":\"%s\",\"width\":%u,\"height\":%u}", b64, width, height);
-    json_send_response(id, resp);
+    yyjson_mut_doc *doc = json_frame_doc(id);
+    if (doc) {
+        yyjson_mut_val *result = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, result, "png", b64);
+        yyjson_mut_obj_add_uint(doc, result, "width", width);
+        yyjson_mut_obj_add_uint(doc, result, "height", height);
+        json_send_result(doc, result);
+    }
 
     for (uint16_t y = 0; y < height; y++) free(rows[y]);
     png_destroy_write_struct(&png_ptr, &info_ptr);
     free(mem_write.buffer);
     free(b64);
-    free(resp);
     return false;
 }
 
-typedef bool (*json_command_handler_t)(unsigned id, const char *params);
+typedef bool (*json_command_handler_t)(unsigned id, yyjson_val *params);
 
 typedef struct {
     const char *name;
@@ -1167,33 +1109,41 @@ static const json_command_t json_commands[] = {
     {"screenshot", handle_screenshot},
 };
 
-// Returns true if the command loop should stop
+// Parse a JSON-RPC request line and dispatch to its handler.
+// Returns true if the command loop should stop.
 static bool json_handle_command(const char *line)
 {
-    json_pool_pos = 0;
-
-    unsigned id = (unsigned) json_get_number(line, "id", 0);
-
-    const char *method_value = json_object_find(line, "method");
-    if (!method_value) {
+    yyjson_doc *doc = yyjson_read(line, strlen(line), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        json_send_error(0, "invalid json");
+        yyjson_doc_free(doc);
+        return false;
+    }
+    unsigned id = (unsigned) yyjson_get_uint(yyjson_obj_get(root, "id"));
+    const char *method = yyjson_get_str(yyjson_obj_get(root, "method"));
+    if (!method) {
         json_send_error(id, "missing method");
+        yyjson_doc_free(doc);
         return false;
     }
-    char method[128];
-    if (!json_parse_string(method_value, method, sizeof(method))) {
-        json_send_error(id, "invalid method");
-        return false;
-    }
+    yyjson_val *params = yyjson_obj_get(root, "params");
+    if (!yyjson_is_obj(params)) params = NULL;
 
-    const char *params = json_get_params(line);
+    bool stop = false;
+    bool matched = false;
     for (const json_command_t *command = json_commands;
          command < json_commands + sizeof(json_commands) / sizeof(json_commands[0]); command++) {
         if (strcmp(method, command->name) == 0) {
-            return command->handler(id, params);
+            matched = true;
+            stop = command->handler(id, params);
+            break;
         }
     }
-    json_send_error(id, "unknown method");
-    return false;
+    if (!matched) json_send_error(id, "unknown method");
+
+    yyjson_doc_free(doc);
+    return stop;
 }
 
 static void json_boot_rom_callback(GB_gameboy_t *gb, GB_boot_rom_t type)
@@ -1254,14 +1204,22 @@ void json_mode_run(const char *rom_path)
         json_running = true;
     }
 
-    json_send_notification("ready", rom_path ? "{\"rom\":\"loaded\"}" : "{}");
+    {
+        yyjson_mut_doc *doc = json_notification_doc("ready");
+        if (doc) {
+            yyjson_mut_val *params = yyjson_mut_obj(doc);
+            if (rom_path) yyjson_mut_obj_add_str(doc, params, "rom", "loaded");
+            yyjson_mut_obj_add_val(doc, yyjson_mut_doc_get_root(doc), "params", params);
+            json_send_doc(doc);
+        }
+    }
     if (json_window) SDL_ShowWindow(json_window);
 
     // Command loop — non-blocking stdin so the emulator and SDL stay responsive
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-    static char line[JSON_MAX_LINE];
+    static char line[65536];
     size_t line_pos = 0;
     while (!json_shutdown_requested) {
         // Run one frame worth of instructions with real-time pacing

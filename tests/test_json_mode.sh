@@ -261,7 +261,7 @@ run_test "T27: Emulator pause" \
 
 # T28: Emulator resume (runs until breakpoint, returns "stopped")
 run_test "T28: Emulator resume" \
-  '{"id":1,"method":"breakpoint.add","params":{"address":0x0100}}
+  '{"id":1,"method":"breakpoint.add","params":{"address":256}}
    {"id":2,"method":"emulator.resume"}
    {"id":3,"method":"quit"}' \
   '"stopped"'
